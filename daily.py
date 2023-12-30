@@ -1,0 +1,390 @@
+from __future__ import division
+
+import json
+import re
+import time
+import datetime
+
+import hashlib
+from base64 import b64decode
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import unpad
+
+from pandas import DataFrame, isnull, notnull, to_datetime
+
+from pandas_datareader._utils import RemoteDataError
+from pandas_datareader.base import _DailyBaseReader
+from pandas_datareader.yahoo.headers import DEFAULT_HEADERS
+
+# return a DataFrame object
+def read_csv(filename, period1, period2):
+	#1. read the 1st line
+	#print("read csv: ", filename); 
+	arrLines = open(filename, "r").readlines();
+	line1 = arrLines[0];
+	arrLines = arrLines[1:];
+
+	#2. build up columns
+	cols = line1.split(",");
+	cols[-1] = cols[-1].replace("\n", "");
+	records = [];
+	for line in arrLines:
+		rec = line.split(",");
+		for j in range(1,6):
+			rec[j] = float(rec[j]);
+		rec[6] = float(rec[6][:-1]);
+#		print(rec[6])
+		s_date = rec[0];
+		d_date = to_datetime(s_date);
+		sec_date = (d_date - datetime.datetime(1970, 1, 1)).total_seconds();
+#		print("sec_date", sec_date);
+		if sec_date >= period1 and sec_date <=period2:
+			records.append(rec);
+	#3. construct DaatFrame object
+	#print("cols", cols);
+	#print("rec", rec);
+	#print(records);
+	d = {}
+	for k in range(len(cols)):
+		d[cols[k]] = []
+	for i in range(len(cols)):	
+		for x in range(len(records)):
+			d[cols[i]].append(records[x][i])
+
+	#4. return a DataFrame object 
+	df = DataFrame(d)
+	return df
+
+def decrypt_cryptojs_aes(data):
+    encrypted_stores = data['context']['dispatcher']['stores']
+    _cs = data["_cs"]
+    _cr = data["_cr"]
+
+    _cr = b"".join(int.to_bytes(i, length=4, byteorder="big", signed=True) for i in json.loads(_cr)["words"])
+    password = hashlib.pbkdf2_hmac("sha1", _cs.encode("utf8"), _cr, 1, dklen=32).hex()
+
+    encrypted_stores = b64decode(encrypted_stores)
+    assert encrypted_stores[0:8] == b"Salted__"
+    salt = encrypted_stores[8:16]
+    encrypted_stores = encrypted_stores[16:]
+
+    def EVPKDF(
+            password,
+            salt,
+            keySize=32,
+            ivSize=16,
+            iterations=1,
+            hashAlgorithm="md5",
+    ) -> tuple:
+        """OpenSSL EVP Key Derivation Function
+        Args:
+            password (Union[str, bytes, bytearray]): Password to generate key from.
+            salt (Union[bytes, bytearray]): Salt to use.
+            keySize (int, optional): Output key length in bytes. Defaults to 32.
+            ivSize (int, optional): Output Initialization Vector (IV) length in bytes. Defaults to 16.
+            iterations (int, optional): Number of iterations to perform. Defaults to 1.
+            hashAlgorithm (str, optional): Hash algorithm to use for the KDF. Defaults to 'md5'.
+        Returns:
+            key, iv: Derived key and Initialization Vector (IV) bytes.
+        Taken from: https://gist.github.com/rafiibrahim8/0cd0f8c46896cafef6486cb1a50a16d3
+        OpenSSL original code: https://github.com/openssl/openssl/blob/master/crypto/evp/evp_key.c#L78
+        """
+
+        assert iterations > 0, "Iterations can not be less than 1."
+
+        if isinstance(password, str):
+            password = password.encode("utf-8")
+
+        final_length = keySize + ivSize
+        key_iv = b""
+        block = None
+
+        while len(key_iv) < final_length:
+            hasher = hashlib.new(hashAlgorithm)
+            if block:
+                hasher.update(block)
+            hasher.update(password)
+            hasher.update(salt)
+            block = hasher.digest()
+            for _ in range(1, iterations):
+                block = hashlib.new(hashAlgorithm, block).digest()
+            key_iv += block
+
+        key, iv = key_iv[:keySize], key_iv[keySize:final_length]
+        return key, iv
+
+    key, iv = EVPKDF(password, salt, keySize=32, ivSize=16, iterations=1, hashAlgorithm="md5")
+
+    cipher = AES.new(key, AES.MODE_CBC, iv=iv)
+    plaintext = cipher.decrypt(encrypted_stores)
+    plaintext = unpad(plaintext, 16, style="pkcs7")
+    decoded_stores = json.loads(plaintext)
+
+    return decoded_stores
+
+
+class YahooDailyReader(_DailyBaseReader):
+    """
+    Returns DataFrame of with historical over date range,
+    start to end.
+    To avoid being penalized by Yahoo! Finance servers, pauses between
+    downloading 'chunks' of symbols can be specified.
+
+    Parameters
+    ----------
+    symbols : string, array-like object (list, tuple, Series), or DataFrame
+        Single stock symbol (ticker), array-like object of symbols or
+        DataFrame with index containing stock symbols.
+    start : string, int, date, datetime, Timestamp
+        Starting date. Parses many different kind of date
+        representations (e.g., 'JAN-01-2010', '1/1/10', 'Jan, 1, 1980'). Defaults to
+        5 years before current date.
+    end : string, int, date, datetime, Timestamp
+        Ending date
+    retry_count : int, default 3
+        Number of times to retry query request.
+    pause : int, default 0.1
+        Time, in seconds, to pause between consecutive queries of chunks. If
+        single value given for symbol, represents the pause between retries.
+    session : Session, default None
+        requests.sessions.Session instance to be used. Passing a session
+        is an advanced usage and you must set any required
+        headers in the session directly.
+    adjust_price : bool, default False
+        If True, adjusts all prices in hist_data ('Open', 'High', 'Low',
+        'Close') based on 'Adj Close' price. Adds 'Adj_Ratio' column and drops
+        'Adj Close'.
+    ret_index : bool, default False
+        If True, includes a simple return index 'Ret_Index' in hist_data.
+    chunksize : int, default 25
+        Number of symbols to download consecutively before intiating pause.
+    interval : string, default 'd'
+        Time interval code, valid values are 'd' for daily, 'w' for weekly,
+        'm' for monthly.
+    get_actions : bool, default False
+        If True, adds Dividend and Split columns to dataframe.
+    adjust_dividends: bool, default true
+        If True, adjusts dividends for splits.
+    """
+
+    def __init__(
+            self,
+            symbols=None,
+            start=None,
+            end=None,
+            retry_count=3,
+            pause=0.1,
+            session=None,
+            adjust_price=False,
+            ret_index=False,
+            chunksize=1,
+            interval="d",
+            get_actions=False,
+            adjust_dividends=True,
+    ):
+        super().__init__(
+            symbols=symbols,
+            start=start,
+            end=end,
+            retry_count=retry_count,
+            pause=pause,
+            session=session,
+            chunksize=chunksize,
+        )
+
+        # Ladder up the wait time between subsequent requests to improve
+        # probability of a successful retry
+        self.pause_multiplier = 2.5
+        if session is None:
+            self.headers = DEFAULT_HEADERS
+        else:
+            self.headers = session.headers
+
+        self.adjust_price = adjust_price
+        self.ret_index = ret_index
+        self.interval = interval
+        self._get_actions = get_actions
+
+        if self.interval not in ["d", "wk", "mo", "m", "w"]:
+            raise ValueError(
+                "Invalid interval: valid values are  'd', 'wk' and 'mo'. 'm' and 'w' "
+                "have been implemented for backward compatibility. 'v' has been moved "
+                "to the yahoo-actions or yahoo-dividends APIs."
+            )
+        elif self.interval in ["m", "mo"]:
+            self.pdinterval = "m"
+            self.interval = "mo"
+        elif self.interval in ["w", "wk"]:
+            self.pdinterval = "w"
+            self.interval = "wk"
+
+        self.interval = "1" + self.interval
+        self.adjust_dividends = adjust_dividends
+
+    @property
+    def get_actions(self):
+        return self._get_actions
+
+    @property
+    def url(self):
+        return "https://finance.yahoo.com/quote/{}/history"
+
+    # Test test_get_data_interval() crashed because of this issue, probably
+    # whole yahoo part of package wasn't
+    # working properly
+    def _get_params(self, symbol):
+        # This needed because yahoo returns data shifted by 4 hours ago.
+        four_hours_in_seconds = 14400
+        unix_start = int(time.mktime(self.start.timetuple()))
+        unix_start += four_hours_in_seconds
+        day_end = self.end.replace(hour=23, minute=59, second=59)
+        unix_end = int(time.mktime(day_end.timetuple()))
+        unix_end += four_hours_in_seconds
+
+        params = {
+            "period1": unix_start,
+            "period2": unix_end,
+            "interval": self.interval,
+            "frequency": self.interval,
+            "filter": "history",
+            "symbol": symbol,
+        }
+        return params
+
+    def _read_one_data(self, url, params):
+        """read one data from specified symbol"""
+
+        print("DEBUG USE 301: parmeter", params);
+        period1= params["period1"]
+        period2= params["period2"]
+
+
+        symbol = params["symbol"]
+        del params["symbol"]
+        url = url.format(symbol)
+        ticker = url.replace("https://finance.yahoo.com/quote/", "");
+        ticker = ticker.replace("/history", "");
+        print("URL", url);
+        print("TICKER", ticker);
+        filename = ticker + ".csv";
+        data = "NA";
+
+        resp = self._get_response(url, params=params, headers=self.headers)
+        ptrn = r"root\.App\.main = (.*?);\n}\(this\)\);"
+        try:
+            j = json.loads(re.search(ptrn, resp.text, re.DOTALL).group(1))
+
+            if "_cs" in j and "_cr" in j:
+                new_j = decrypt_cryptojs_aes(j)  # returns j["context"]["dispatcher"]["stores"]
+                # from old code
+                data = new_j['HistoricalPriceStore'] # CHANGED!!!
+
+        except KeyError:
+            msg = "No data fetched for symbol {} using {}"
+            raise RemoteDataError(msg.format(symbol, self.__class__.__name__))
+
+        # price data
+        if data=="NA":
+           prices = read_csv('BTC-USD2.csv', period1, period2); 
+        else:
+            prices = DataFrame(data["prices"])
+        prices.columns = [col.capitalize() for col in prices.columns]
+        prices["Date"] = to_datetime(to_datetime(prices["Date"]).dt.date)
+		# Nicole: dropped the unit="s" requirement
+
+        if "Data" in prices.columns:
+            prices = prices[prices["Data"].isnull()]
+        prices = prices[["Date", "High", "Low", "Open", "Close", "Volume", "Adj close"]]
+        #prices = prices[["Date", "High", "Low", "Open", "Close", "Volume", "Adjclose"]]
+        #prices = prices[["Date", "High", "Low", "Open", "Close"]]; # RECOVER ABOVE LINE LATER
+        prices = prices.rename(columns={"Adj close": "Adj Close"})
+
+        prices = prices.set_index("Date")
+        prices = prices.sort_index().dropna(how="all")
+
+        if self.ret_index:
+            prices["Ret_Index"] = _calc_return_index(prices["Adj Close"])
+        if self.adjust_price:
+            prices = _adjust_prices(prices)
+
+        # dividends & splits data
+        if self.get_actions and data["eventsData"]:
+
+            actions = DataFrame(data["eventsData"])
+            actions.columns = [col.capitalize() for col in actions.columns]
+            actions["Date"] = to_datetime(
+                to_datetime(actions["Date"], unit="s").dt.date
+            )
+
+            types = actions["Type"].unique()
+            if "DIVIDEND" in types:
+                divs = actions[actions.Type == "DIVIDEND"].copy()
+                divs = divs[["Date", "Amount"]].reset_index(drop=True)
+                divs = divs.set_index("Date")
+                divs = divs.rename(columns={"Amount": "Dividends"})
+                prices = prices.join(divs, how="outer")
+
+            if "SPLIT" in types:
+
+                def split_ratio(row):
+                    if float(row["Numerator"]) > 0:
+                        if ":" in row["Splitratio"]:
+                            n, m = row["Splitratio"].split(":")
+                            return float(m) / float(n)
+                        else:
+                            return eval(row["Splitratio"])
+                    else:
+                        return 1
+
+                splits = actions[actions.Type == "SPLIT"].copy()
+                splits["SplitRatio"] = splits.apply(split_ratio, axis=1)
+                splits = splits.reset_index(drop=True)
+                splits = splits.set_index("Date")
+                splits["Splits"] = splits["SplitRatio"]
+                prices = prices.join(splits["Splits"], how="outer")
+
+                if "DIVIDEND" in types and not self.adjust_dividends:
+                    # dividends are adjusted automatically by Yahoo
+                    adj = (
+                        prices["Splits"].sort_index(ascending=False).fillna(1).cumprod()
+                    )
+                    prices["Dividends"] = prices["Dividends"] / adj
+
+        return prices
+
+
+def _adjust_prices(hist_data, price_list=None):
+    """
+    Return modifed DataFrame with adjusted prices based on
+    'Adj Close' price. Adds 'Adj_Ratio' column.
+    """
+    if price_list is None:
+        price_list = "Open", "High", "Low", "Close", "Volume", "Adj Close" #EDITED
+    adj_ratio = hist_data["Adj Close"] / hist_data["Close"]
+
+    data = hist_data.copy()
+    for item in price_list:
+        data[item] = hist_data[item] * adj_ratio
+    data["Adj_Ratio"] = adj_ratio
+    del data["Adj Close"]
+    return data
+
+
+def _calc_return_index(price_df):
+    """
+    Return a returns index from a input price df or series. Initial value
+    (typically NaN) is set to 1.
+    """
+    df = price_df.pct_change().add(1).cumprod()
+    mask = notnull(df.iloc[1]) & isnull(df.iloc[0])
+    if mask:
+        df.loc[df.index[0]] = 1
+
+    # Check for first stock listings after starting date of index in ret_index
+    # If True, find first_valid_index and set previous entry to 1.
+    if not mask:
+        tstamp = df.first_valid_index()
+        t_idx = df.index.get_loc(tstamp) - 1
+        df.iloc[t_idx] = 1
+
+    return df
